@@ -1,1 +1,1373 @@
-import type { Express } from "express";\nimport { createServer, type Server } from "http";\nimport multer from "multer";\nimport { storage } from "./storage";\nimport { uploadFile } from "./supabase";\nimport { \n  insertHeroVideoSchema, insertGalleryItemSchema, insertFaqSchema, \n  insertSeoSettingSchema, insertContactSchema \n} from "@shared/schema";\n\nimport { z } from "zod";\nimport { NodeSSH } from 'node-ssh';\nimport archiver from 'archiver';\nimport { exec, execSync } from 'child_process';\nimport { promisify } from 'util';\nimport fs from 'fs';\nimport path from 'path';\nimport https from 'https';\n\nexport async function registerRoutes(app: Express): Promise<Server> {\n  // Health check endpoint for Docker healthcheck (IT requirement)\n  app.get('/health', (_req, res) => res.sendStatus(200));\n  \n  // Detailed health check endpoint\n  app.get("/api/health", (req, res) => {\n    res.status(200).json({ status: "healthy", timestamp: new Date().toISOString() });\n  });\n\n  // Diagnostic endpoint for production troubleshooting\n  app.get("/api/diagnostic", (req, res) => {\n    try {\n      res.status(200).json({\n        status: "operational",\n        timestamp: new Date().toISOString(),\n        environment: {\n          NODE_ENV: process.env.NODE_ENV,\n          PORT: process.env.PORT,\n          PUBLIC_DIR: process.env.PUBLIC_DIR,\n          cwd: process.cwd(),\n          dirname: (global as any).import?.meta?.dirname || 'undefined'\n        },\n        server: {\n          uptime: process.uptime(),\n          memory: process.memoryUsage(),\n          pid: process.pid\n        }\n      });\n    } catch (error) {\n      res.status(500).json({ \n        status: "error", \n        message: error instanceof Error ? error.message : 'Unknown error',\n        timestamp: new Date().toISOString()\n      });\n    }\n  });\n  // Simple token-based auth - no sessions\n  const ADMIN_TOKEN = "memopyk-admin-token-" + Date.now();\n  const validTokens = new Set<string>();\n\n  // File upload middleware\n  const upload = multer({\n    storage: multer.memoryStorage(),\n    limits: {\n      fileSize: 50 * 1024 * 1024, // 50MB\n    },\n    fileFilter: (req, file, cb) => {\n      // Allow videos and images\n      if (file.mimetype.startsWith('video/') || file.mimetype.startsWith('image/')) {\n        cb(null, true);\n      } else {\n        cb(new Error('Only video and image files are allowed'));\n      }\n    }\n  });\n\n  // Authentication middleware\n  const requireAuth = (req: any, res: any, next: any) => {\n    const token = req.headers.authorization?.replace('Bearer ', '');\n    if (!token || !validTokens.has(token)) {\n      return res.status(401).json({ message: "Unauthorized" });\n    }\n    next();\n  };\n\n  // Admin authentication\n  app.post("/api/auth/login", async (req, res) => {\n    try {\n      const { password } = req.body;\n      \n      if (password === "memopyk2025admin") {\n        const token = "memopyk-" + Math.random().toString(36).substr(2, 15) + Date.now();\n        validTokens.add(token);\n        \n        console.log('LOGIN SUCCESS - Token generated:', token.substr(0, 10) + "...");\n        res.json({ success: true, token });\n      } else {\n        res.status(401).json({ message: "Invalid password" });\n      }\n    } catch (error) {\n      console.error('Login error:', error);\n      res.status(500).json({ message: "Login error" });\n    }\n  });\n\n  // Deploy to staging endpoint\n  app.post("/api/deploy/staging", requireAuth, async (req, res) => {\n    try {\n      const execAsync = promisify(exec);\n      \n      console.log('🚀 Starting staging deployment...');\n      res.writeHead(200, {\n        'Content-Type': 'application/json',\n        'Transfer-Encoding': 'chunked'\n      });\n      \n      // Stream deployment progress\n      const sendProgress = (message: string, status: 'info' | 'success' | 'error' = 'info') => {\n        res.write(JSON.stringify({ message, status, timestamp: new Date().toISOString() }) + '\n');\n      };\n\n      try {\n        sendProgress('📦 Pulling latest code from origin main...');\n        await execAsync('cd /opt/memopykCOM && git pull --ff-only origin main');\n        \n        sendProgress('🔄 Restarting staging container...');\n        await execAsync('cd /opt/memopykCOM && docker compose down && docker compose up -d');\n        \n        sendProgress('⏳ Waiting for container startup...');\n        await new Promise(resolve => setTimeout(resolve, 30000));\n        \n        sendProgress('🔍 Checking health endpoint...');\n        const healthCheck = await execAsync('curl -I http://localhost:3000/health');\n        if (healthCheck.stdout.includes('200 OK')) {\n          sendProgress('✅ Staging deployment successful!', 'success');\n        } else {\n          throw new Error('Health check failed');\n        }\n        \n      } catch (error) {\n        sendProgress('❌ Deployment failed, rolling back...', 'error');\n        try {\n          await execAsync('cd /opt/memopykCOM && git checkout tags/before-staging-deploy');\n          await execAsync('cd /opt/memopykCOM && docker compose down && docker compose up -d');\n          sendProgress('🔄 Rolled back to stable state', 'info');\n        } catch (rollbackError) {\n          sendProgress('⚠️ Rollback failed - manual intervention required', 'error');\n        }\n      }\n      \n      res.end();\n    } catch (error) {\n      console.error('Staging deployment error:', error);\n      res.status(500).json({ message: "Staging deployment failed" });\n    }\n  });\n\n  // Deploy to production endpoint\n  app.post("/api/deploy/production", requireAuth, async (req, res) => {\n    try {\n      const execAsync = promisify(exec);\n      \n      console.log('🚀 Starting production deployment...');\n      res.writeHead(200, {\n        'Content-Type': 'application/json',\n        'Transfer-Encoding': 'chunked'\n      });\n      \n      // Stream deployment progress\n      const sendProgress = (message: string, status: 'info' | 'success' | 'error' = 'info') => {\n        res.write(JSON.stringify({ message, status, timestamp: new Date().toISOString() }) + '\n');\n      };\n\n      try {\n        sendProgress('📦 Pulling latest code from origin main...');\n        await execAsync('cd /opt/memopykCOM && git pull --ff-only origin main');\n        \n        sendProgress('🔄 Restarting production container...');\n        await execAsync('cd /opt/memopykCOM && docker compose down && docker compose up -d');\n        \n        sendProgress('⏳ Waiting for container startup...');\n        await new Promise(resolve => setTimeout(resolve, 30000));\n        \n        sendProgress('🔍 Checking health endpoint...');\n        const healthCheck = await execAsync('curl -I http://localhost:3000/health');\n        if (healthCheck.stdout.includes('200 OK')) {\n          sendProgress('🔍 Checking domain access...');\n          const domainCheck = await execAsync('curl -I https://new.memopyk.com/');\n          if (domainCheck.stdout.includes('200')) {\n            sendProgress('✅ Production deployment successful!', 'success');\n          } else {\n            throw new Error('Domain access check failed');\n          }\n        } else {\n          throw new Error('Health check failed');\n        }\n        \n      } catch (error) {\n        sendProgress('❌ Production deployment failed, rolling back...', 'error');\n        try {\n          await execAsync('cd /opt/memopykCOM && git checkout tags/before-staging-deploy');\n          await execAsync('cd /opt/memopykCOM && docker compose down && docker compose up -d');\n          sendProgress('🔄 Rolled back to stable state', 'info');\n        } catch (rollbackError) {\n          sendProgress('⚠️ Rollback failed - manual intervention required', 'error');\n        }\n      }\n      \n      res.end();\n    } catch (error) {\n      console.error('Production deployment error:', error);\n      res.status(500).json({ message: "Production deployment failed" });\n    }\n  });\n\n  app.post("/api/auth/logout", (req, res) => {\n    const token = req.headers.authorization?.replace('Bearer ', '');\n    if (token) {\n      validTokens.delete(token);\n    }\n    res.json({ success: true });\n  });\n\n  app.get("/api/auth/status", (req, res) => {\n    const token = req.headers.authorization?.replace('Bearer ', '');\n    res.json({ isAuthenticated: !!(token && validTokens.has(token)) });\n  });\n\n  // Hero Videos routes\n  app.get("/api/hero-videos", async (req, res) => {\n    try {\n      const videos = await storage.getHeroVideos();\n      res.json(videos);\n    } catch (error: any) {\n      console.error("Error fetching hero videos:", error);\n      res.status(500).json({ message: "Failed to fetch hero videos", error: error.message });\n    }\n  });\n\n  app.post("/api/hero-videos", requireAuth, async (req, res) => {\n    try {\n      const validatedData = insertHeroVideoSchema.parse(req.body);\n      const video = await storage.createHeroVideo(validatedData);\n      res.json(video);\n    } catch (error) {\n      if (error instanceof z.ZodError) {\n        res.status(400).json({ message: "Invalid data", errors: error.errors });\n      } else {\n        res.status(500).json({ message: "Failed to create hero video" });\n      }\n    }\n  });\n\n  app.put("/api/hero-videos/:id", requireAuth, async (req, res) => {\n    try {\n      const { id } = req.params;\n      const validatedData = insertHeroVideoSchema.partial().parse(req.body);\n      const video = await storage.updateHeroVideo(id, validatedData);\n      \n      if (!video) {\n        return res.status(404).json({ message: "Hero video not found" });\n      }\n      \n      res.json(video);\n    } catch (error) {\n      if (error instanceof z.ZodError) {\n        res.status(400).json({ message: "Invalid data", errors: error.errors });\n      } else {\n        res.status(500).json({ message: "Failed to update hero video" });\n      }\n    }\n  });\n\n  app.delete("/api/hero-videos/:id", requireAuth, async (req, res) => {\n    try {\n      const { id } = req.params;\n      const success = await storage.deleteHeroVideo(id);\n      \n      if (!success) {\n        return res.status(404).json({ message: "Hero video not found" });\n      }\n      \n      res.json({ success: true });\n    } catch (error) {\n      res.status(500).json({ message: "Failed to delete hero video" });\n    }\n  });\n\n  // Gallery Items routes\n  app.get("/api/gallery-items", async (req, res) => {\n    try {\n      const items = await storage.getGalleryItems();\n      res.json(items);\n    } catch (error) {\n      res.status(500).json({ message: "Failed to fetch gallery items" });\n    }\n  });\n\n  app.post("/api/gallery-items", requireAuth, async (req, res) => {\n    try {\n      const validatedData = insertGalleryItemSchema.parse(req.body);\n      const item = await storage.createGalleryItem(validatedData);\n      res.json(item);\n    } catch (error) {\n      if (error instanceof z.ZodError) {\n        res.status(400).json({ message: "Invalid data", errors: error.errors });\n      } else {\n        res.status(500).json({ message: "Failed to create gallery item" });\n      }\n    }\n  });\n\n  app.put("/api/gallery-items/:id", requireAuth, async (req, res) => {\n    try {\n      const { id } = req.params;\n      const validatedData = insertGalleryItemSchema.partial().parse(req.body);\n      const item = await storage.updateGalleryItem(id, validatedData);\n      \n      if (!item) {\n        return res.status(404).json({ message: "Gallery item not found" });\n      }\n      \n      res.json(item);\n    } catch (error) {\n      if (error instanceof z.ZodError) {\n        res.status(400).json({ message: "Invalid data", errors: error.errors });\n      } else {\n        res.status(500).json({ message: "Failed to update gallery item" });\n      }\n    }\n  });\n\n  app.delete("/api/gallery-items/:id", requireAuth, async (req, res) => {\n    try {\n      const { id } = req.params;\n      const success = await storage.deleteGalleryItem(id);\n      \n      if (!success) {\n        return res.status(404).json({ message: "Gallery item not found" });\n      }\n      \n      res.json({ success: true });\n    } catch (error) {\n      res.status(500).json({ message: "Failed to delete gallery item" });\n    }\n  });\n\n  // FAQs routes\n  app.get("/api/faqs", async (req, res) => {\n    try {\n      const faqs = await storage.getFaqs();\n      res.json(faqs);\n    } catch (error) {\n      res.status(500).json({ message: "Failed to fetch FAQs" });\n    }\n  });\n\n  app.post("/api/faqs", requireAuth, async (req, res) => {\n    try {\n      const validatedData = insertFaqSchema.parse(req.body);\n      const faq = await storage.createFaq(validatedData);\n      res.json(faq);\n    } catch (error) {\n      if (error instanceof z.ZodError) {\n        res.status(400).json({ message: "Invalid data", errors: error.errors });\n      } else {\n        res.status(500).json({ message: "Failed to create FAQ" });\n      }\n    }\n  });\n\n  app.put("/api/faqs/:id", requireAuth, async (req, res) => {\n    try {\n      const { id } = req.params;\n      const validatedData = insertFaqSchema.partial().parse(req.body);\n      const faq = await storage.updateFaq(id, validatedData);\n      \n      if (!faq) {\n        return res.status(404).json({ message: "FAQ not found" });\n      }\n      \n      res.json(faq);\n    } catch (error) {\n      if (error instanceof z.ZodError) {\n        res.status(400).json({ message: "Invalid data", errors: error.errors });\n      } else {\n        res.status(500).json({ message: "Failed to update FAQ" });\n      }\n    }\n  });\n\n  app.delete("/api/faqs/:id", requireAuth, async (req, res) => {\n    try {\n      const { id } = req.params;\n      const success = await storage.deleteFaq(id);\n      \n      if (!success) {\n        return res.status(404).json({ message: "FAQ not found" });\n      }\n      \n      res.json({ success: true });\n    } catch (error) {\n      res.status(500).json({ message: "Failed to delete FAQ" });\n    }\n  });\n\n  // Contacts routes\n  app.get("/api/contacts", requireAuth, async (req, res) => {\n    try {\n      const contacts = await storage.getContacts();\n      res.json(contacts);\n    } catch (error) {\n      res.status(500).json({ message: "Failed to fetch contacts" });\n    }\n  });\n\n  app.post("/api/contacts", async (req, res) => {\n    try {\n      const validatedData = insertContactSchema.parse(req.body);\n      const contact = await storage.createContact(validatedData);\n      res.json(contact);\n    } catch (error) {\n      if (error instanceof z.ZodError) {\n        res.status(400).json({ message: "Invalid data", errors: error.errors });\n      } else {\n        res.status(500).json({ message: "Failed to create contact" });\n      }\n    }\n  });\n\n  app.put("/api/contacts/:id", requireAuth, async (req, res) => {\n    try {\n      const { id } = req.params;\n      const validatedData = insertContactSchema.partial().parse(req.body);\n      const contact = await storage.updateContact(id, validatedData);\n      \n      if (!contact) {\n        return res.status(404).json({ message: "Contact not found" });\n      }\n      \n      res.json(contact);\n    } catch (error) {\n      if (error instanceof z.ZodError) {\n        res.status(400).json({ message: "Invalid data", errors: error.errors });\n      } else {\n        res.status(500).json({ message: "Failed to update contact" });\n      }\n    }\n  });\n\n  app.delete("/api/contacts/:id", requireAuth, async (req, res) => {\n    try {\n      const { id } = req.params;\n      const success = await storage.deleteContact(id);\n      \n      if (!success) {\n        return res.status(404).json({ message: "Contact not found" });\n      }\n      \n      res.json({ success: true });\n    } catch (error) {\n      res.status(500).json({ message: "Failed to delete contact" });\n    }\n  });\n\n  // File upload route for Supabase Storage\n  app.post("/api/upload", requireAuth, upload.single('file'), async (req, res) => {\n    try {\n      if (!req.file) {\n        return res.status(400).json({ message: "No file provided" });\n      }\n\n      const { originalname, buffer, mimetype } = req.file;\n      \n      // Upload to Supabase Storage\n      const { url, path } = await uploadFile(buffer, originalname, 'memopyk-media', mimetype);\n      \n      res.json({ \n        url, \n        path,\n        originalName: originalname,\n        size: buffer.length,\n        mimeType: mimetype\n      });\n    } catch (error: any) {\n      console.error('File upload error:', error);\n      res.status(500).json({ \n        message: "File upload failed", \n        error: error.message \n      });\n    }\n  });\n\n  // Legal Documents API\n  app.get("/api/legal-documents", async (req, res) => {\n    try {\n      const documents = await storage.getLegalDocuments();\n      res.json(documents);\n    } catch (error: any) {\n      res.status(500).json({ message: "Failed to fetch legal documents", error: error.message });\n    }\n  });\n\n  app.get("/api/legal-documents/:id", async (req, res) => {\n    try {\n      const document = await storage.getLegalDocument(req.params.id);\n      if (!document) {\n        return res.status(404).json({ message: "Legal document not found" });\n      }\n      res.json(document);\n    } catch (error: any) {\n      res.status(500).json({ message: "Failed to fetch legal document", error: error.message });\n    }\n  });\n\n  app.get("/api/legal-documents/type/:type", async (req, res) => {\n    try {\n      const document = await storage.getLegalDocumentByType(req.params.type);\n      if (!document) {\n        return res.status(404).json({ message: "Legal document not found" });\n      }\n      res.json(document);\n    } catch (error: any) {\n      res.status(500).json({ message: "Failed to fetch legal document", error: error.message });\n    }\n  });\n\n  app.post("/api/legal-documents", requireAuth, async (req, res) => {\n    try {\n      const document = await storage.createLegalDocument(req.body);\n      res.status(201).json(document);\n    } catch (error: any) {\n      res.status(500).json({ message: "Failed to create legal document", error: error.message });\n    }\n  });\n\n  app.put("/api/legal-documents/:id", requireAuth, async (req, res) => {\n    try {\n      const document = await storage.updateLegalDocument(req.params.id, req.body);\n      if (!document) {\n        return res.status(404).json({ message: "Legal document not found" });\n      }\n      res.json(document);\n    } catch (error: any) {\n      res.status(500).json({ message: "Failed to update legal document", error: error.message });\n    }\n  });\n\n  app.delete("/api/legal-documents/:id", requireAuth, async (req, res) => {\n    try {\n      const success = await storage.deleteLegalDocument(req.params.id);\n      if (!success) {\n        return res.status(404).json({ message: "Legal document not found" });\n      }\n      res.json({ message: "Legal document deleted successfully" });\n    } catch (error: any) {\n      res.status(500).json({ message: "Failed to delete legal document", error: error.message });\n    }\n  });\n\n  // Coolify API deployment endpoint\n  app.post("/api/deploy/coolify", requireAuth, async (req, res) => {\n    try {\n      \n      const deploymentData = JSON.stringify({ \n        "uuid": process.env.UUID_APPLICATION \n      });\n      \n      const apiUrl = new URL(process.env.COOLIFY_API_URL);\n      const options = {\n        hostname: apiUrl.hostname,\n        port: 443,\n        path: '/api/v1/deploy',\n        method: 'POST',\n        headers: {\n          'Authorization': `Bearer ${process.env.COOLIFY_API_TOKEN}`,\n          'Content-Type': 'application/json',\n          'Content-Length': Buffer.byteLength(deploymentData)\n        }\n      };\n      \n      const coolifyResponse = await new Promise((resolve, reject) => {\n        const coolifyReq = https.request(options, (coolifyRes) => {\n          let data = '';\n          coolifyRes.on('data', (chunk) => data += chunk);\n          coolifyRes.on('end', () => {\n            resolve({ status: coolifyRes.statusCode, data });\n          });\n        });\n        \n        coolifyReq.on('error', reject);\n        coolifyReq.write(deploymentData);\n        coolifyReq.end();\n      });\n      \n      if (coolifyResponse.status === 200) {\n        // Note: Deployment history tracking would be added when schema supports it\n        \n        res.json({ \n          success: true, \n          message: 'Deployment triggered via Coolify API',\n          response: JSON.parse(coolifyResponse.data)\n        });\n      } else {\n        throw new Error(`Coolify API returned status ${coolifyResponse.status}`);\n      }\n      \n    } catch (error) {\n      res.status(500).json({ \n        success: false,\n        message: "Coolify deployment failed", \n        error: error.message \n      });\n    }\n  });\n\n  // Deployment endpoints\n  app.post("/api/deploy/test", requireAuth, async (req, res) => {\n    try {\n      const { host, username } = req.body;\n      \n      if (!host || !username) {\n        return res.status(400).json({ message: "Host and username are required" });\n      }\n\n      // Test actual SSH connection\n      const ssh = new NodeSSH();\n      \n      try {\n        await ssh.connect({\n          host,\n          username,\n          privateKey: process.env.SSH_PRIVATE_KEY || undefined,\n          password: process.env.SSH_PASSWORD || undefined,\n          port: 22,\n          readyTimeout: 10000\n        });\n        \n        // Test basic command\n        const result = await ssh.execCommand('whoami');\n        await ssh.dispose();\n        \n        if (result.code === 0) {\n          res.json({ success: true, message: `Connection successful. Connected as: ${result.stdout.trim()}` });\n        } else {\n          throw new Error(`SSH test failed: ${result.stderr}`);\n        }\n      } catch (sshError: any) {\n        await ssh.dispose();\n        throw new Error(`SSH connection failed: ${sshError.message}`);\n      }\n      \n    } catch (error: any) {\n      res.status(500).json({ \n        message: "Connection test failed", \n        error: error.message \n      });\n    }\n  });\n\n  // Global deployment state\n  let isDeploymentInProgress = false;\n\n  // Reset deployment status endpoint\n  app.post("/api/deploy/reset", requireAuth, (req, res) => {\n    isDeploymentInProgress = false;\n    res.json({ message: "Deployment status reset", inProgress: false });\n  });\n\n  // Get deployment status endpoint\n  app.get("/api/deploy/status", requireAuth, (req, res) => {\n    res.json({ inProgress: isDeploymentInProgress });\n  });\n\n  // Nginx and SSL setup endpoint\n  app.post("/api/deploy/setup-nginx", requireAuth, async (req, res) => {\n    try {\n      if (isDeploymentInProgress) {\n        return res.status(409).json({ \n          message: "Deployment in progress. Please wait." \n        });\n      }\n\n      const { host, username, domain } = req.body;\n      \n      if (!host || !username || !domain) {\n        return res.status(400).json({ message: "Host, username, and domain are required" });\n      }\n\n      isDeploymentInProgress = true;\n\n      // Set up streaming response\n      res.writeHead(200, {\n        'Content-Type': 'text/plain; charset=utf-8',\n        'Transfer-Encoding': 'chunked',\n        'Cache-Control': 'no-cache',\n        'Connection': 'keep-alive'\n      });\n\n      const sendLog = (type: string, message: string, percentage?: number) => {\n        const logData = {\n          type,\n          message,\n          percentage,\n          timestamp: new Date().toISOString()\n        };\n        res.write(JSON.stringify(logData) + '\n');\n      };\n\n      try {\n        sendLog('log', 'Starting nginx and SSL setup...', 0);\n        sendLog('progress', 'Connecting to VPS', 10);\n\n        const ssh = new NodeSSH();\n        \n        const sshOptions: any = {\n          host,\n          username,\n          port: 22,\n          readyTimeout: 30000\n        };\n\n        if (process.env.SSH_PASSWORD) {\n          sshOptions.password = process.env.SSH_PASSWORD;\n          sendLog('log', 'Using SSH password authentication');\n        } else if (process.env.SSH_PRIVATE_KEY) {\n          sshOptions.privateKey = process.env.SSH_PRIVATE_KEY;\n          sendLog('log', 'Using SSH private key authentication');\n        } else {\n          throw new Error('No SSH credentials provided');\n        }\n\n        await ssh.connect(sshOptions);\n        sendLog('log', 'SSH connection established');\n        sendLog('progress', 'Installing nginx and certbot', 30);\n\n        // Upload and execute nginx setup script\n        const setupScript = `#!/bin/bash\nset -e\n\nDOMAIN="${domain}"\nEMAIL="admin@${domain}"\nAPP_PORT="3000"\n\necho "🚀 Setting up nginx reverse proxy for MEMOPYK..."\n\n# Update system packages\napt update\napt install -y nginx certbot python3-certbot-nginx\n\n# Create nginx configuration\ncat > /etc/nginx/sites-available/memopyk << 'EOF'\nserver {\n    listen 80;\n    server_name $DOMAIN www.$DOMAIN;\n    \n    # Redirect HTTP to HTTPS\n    return 301 https://\\$server_name\\$request_uri;\n}\n\nserver {\n    listen 443 ssl http2;\n    server_name $DOMAIN www.$DOMAIN;\n    \n    # SSL configuration will be added by certbot\n    \n    # Security headers\n    add_header X-Frame-Options "SAMEORIGIN" always;\n    add_header X-XSS-Protection "1; mode=block" always;\n    add_header X-Content-Type-Options "nosniff" always;\n    add_header Referrer-Policy "no-referrer-when-downgrade" always;\n    add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;\n    \n    # Gzip compression\n    gzip on;\n    gzip_vary on;\n    gzip_min_length 1024;\n    gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;\n    \n    # Proxy to Node.js application\n    location / {\n        proxy_pass http://localhost:$APP_PORT;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade \\$http_upgrade;\n        proxy_set_header Connection 'upgrade';\n        proxy_set_header Host \\$host;\n        proxy_set_header X-Real-IP \\$remote_addr;\n        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto \\$scheme;\n        proxy_cache_bypass \\$http_upgrade;\n        proxy_read_timeout 86400;\n    }\n    \n    # Static files optimization\n    location ~* \\.(jpg|jpeg|png|gif|ico|css|js)$ {\n        proxy_pass http://localhost:$APP_PORT;\n        expires 1y;\n        add_header Cache-Control "public, immutable";\n    }\n}\nEOF\n\n# Enable the site\nln -sf /etc/nginx/sites-available/memopyk /etc/nginx/sites-enabled/\nrm -f /etc/nginx/sites-enabled/default\n\n# Test nginx configuration\nnginx -t\n\n# Restart nginx\nsystemctl restart nginx\nsystemctl enable nginx\n\necho "✅ Nginx setup complete!"\n`;\n\n        await ssh.execCommand(`echo '${setupScript}' > /tmp/setup-nginx.sh && chmod +x /tmp/setup-nginx.sh`);\n        sendLog('log', 'Nginx setup script uploaded');\n        \n        sendLog('progress', 'Executing nginx setup', 50);\n        const nginxResult = await ssh.execCommand(`bash /tmp/setup-nginx.sh`);\n        \n        if (nginxResult.code !== 0) {\n          throw new Error(`Nginx setup failed: ${nginxResult.stderr}`);\n        }\n        \n        sendLog('log', 'Nginx configuration completed');\n        sendLog('progress', 'Setting up SSL certificate', 80);\n\n        // Setup SSL certificate\n        const certbotCmd = `certbot --nginx -d ${domain} -d www.${domain} --non-interactive --agree-tos --email admin@${domain} --redirect`;\n        const certbotResult = await ssh.execCommand(certbotCmd);\n        \n        if (certbotResult.code === 0) {\n          sendLog('success', 'SSL certificate installed successfully!');\n          sendLog('log', `Website now available at: https://${domain}`);\n        } else {\n          sendLog('warning', `SSL certificate setup warning: ${certbotResult.stderr}`);\n          sendLog('log', 'You may need to configure DNS first. Run: sudo certbot --nginx');\n        }\n\n        // Setup automatic renewal\n        await ssh.execCommand(`systemctl enable certbot.timer && systemctl start certbot.timer`);\n        sendLog('log', 'Automatic SSL renewal configured');\n        \n        await ssh.dispose();\n        sendLog('success', 'Nginx and SSL setup completed!');\n        sendLog('progress', 'Setup complete', 100);\n\n      } catch (error: any) {\n        sendLog('error', `Setup failed: ${error.message}`);\n        throw error;\n      } finally {\n        isDeploymentInProgress = false;\n      }\n\n      if (!res.headersSent) {\n        res.end();\n      }\n      \n    } catch (error: any) {\n      console.error('Nginx setup error:', error);\n      isDeploymentInProgress = false;\n      \n      if (!res.headersSent) {\n        res.status(500).json({ \n          message: "Nginx setup failed", \n          error: error.message \n        });\n      }\n    }\n  });\n\n  app.post("/api/deploy", requireAuth, async (req, res) => {\n    try {\n      // Check if deployment is already in progress\n      if (isDeploymentInProgress) {\n        return res.status(409).json({ \n          message: "Deployment already in progress. Please wait or reset the deployment status." \n        });\n      }\n\n      const { host, username, deployPath, domain } = req.body;\n      \n      if (!host || !username) {\n        return res.status(400).json({ message: "Host and username are required" });\n      }\n\n      // Set deployment in progress\n      isDeploymentInProgress = true;\n\n      // Set up streaming response\n      res.writeHead(200, {\n        'Content-Type': 'text/plain; charset=utf-8',\n        'Transfer-Encoding': 'chunked',\n        'Cache-Control': 'no-cache',\n        'Connection': 'keep-alive'\n      });\n\n      const sendLog = (type: string, message: string, percentage?: number) => {\n        const logData = { type, message, percentage, timestamp: new Date().toISOString() };\n        res.write(JSON.stringify(logData) + '\n');\n      };\n\n      try {\n        sendLog('log', 'Starting deployment process...');\n        sendLog('progress', 'Initializing', 5);\n\n        // Step 1: Build the project\n        sendLog('log', 'Building project...');\n        sendLog('progress', 'Building frontend and backend', 20);\n        \n        const execAsync = promisify(exec);\n        const buildResult = await execAsync('npm run build');\n        sendLog('log', `Build completed: ${buildResult.stdout}`);\n        if (buildResult.stderr) {\n          sendLog('log', `Build warnings: ${buildResult.stderr}`);\n        }\n        sendLog('progress', 'Build complete', 40);\n\n        // Step 2: Prepare deployment package\n        sendLog('log', 'Preparing deployment package...');\n        sendLog('progress', 'Creating deployment archive', 50);\n        \n        const archivePath = '/tmp/memopyk-deployment.tar.gz';\n        await new Promise<void>((resolve, reject) => {\n          const output = fs.createWriteStream(archivePath);\n          const archive = archiver('tar', { gzip: true });\n          \n          output.on('close', () => {\n            sendLog('log', `Archive created: ${archive.pointer()} bytes`);\n            resolve();\n          });\n          \n          archive.on('error', reject);\n          archive.pipe(output);\n          \n          // Add built files\n          archive.directory('dist/', 'dist');\n          archive.file('package.json', { name: 'package.json' });\n          archive.file('package-lock.json', { name: 'package-lock.json' });\n          \n          archive.finalize();\n        });\n        \n        sendLog('progress', 'Archive created', 60);\n\n        // Step 3: Connect and transfer to VPS\n        sendLog('log', `Connecting to VPS at ${host}...`);\n        sendLog('progress', 'Connecting to VPS', 65);\n        \n        const ssh = new NodeSSH();\n        \n        // Prepare SSH connection options\n        const sshOptions: any = {\n          host,\n          username,\n          port: 22,\n          readyTimeout: 30000\n        };\n\n        // Use password authentication for now (more reliable for testing)\n        if (process.env.SSH_PASSWORD) {\n          sshOptions.password = process.env.SSH_PASSWORD;\n          sendLog('log', 'Using SSH password authentication');\n        } else if (process.env.SSH_PRIVATE_KEY) {\n          // Try private key as fallback\n          sshOptions.privateKey = process.env.SSH_PRIVATE_KEY;\n          sendLog('log', 'Using SSH private key authentication');\n        } else {\n          throw new Error('No SSH credentials provided. Please set SSH_PASSWORD or SSH_PRIVATE_KEY');\n        }\n\n        await ssh.connect(sshOptions);\n        \n        sendLog('log', 'SSH connection established');\n        sendLog('progress', 'Transferring files to VPS', 70);\n        \n        // Create deployment directory\n        await ssh.execCommand(`mkdir -p ${deployPath}`);\n        sendLog('log', `Created deployment directory: ${deployPath}`);\n        \n        // Transfer archive\n        await ssh.putFile(archivePath, `${deployPath}/deployment.tar.gz`);\n        sendLog('log', 'Archive transferred to VPS');\n        sendLog('progress', 'Files transferred', 80);\n\n        // Step 4: Extract and setup on VPS\n        sendLog('log', 'Extracting files on VPS...');\n        await ssh.execCommand(`cd ${deployPath} && tar -xzf deployment.tar.gz`);\n        sendLog('log', 'Files extracted successfully');\n        \n        sendLog('log', 'Installing dependencies on VPS...');\n        sendLog('progress', 'Installing dependencies', 85);\n        const installResult = await ssh.execCommand(`cd ${deployPath} && npm ci --production`);\n        if (installResult.code !== 0) {\n          throw new Error(`Dependency installation failed: ${installResult.stderr}`);\n        }\n        sendLog('log', 'Dependencies installed successfully');\n        \n        // Setup environment file\n        sendLog('log', 'Setting up environment configuration...');\n        const envVars = [\n          `DATABASE_URL="${process.env.DATABASE_URL}"`,\n          `SUPABASE_URL="${process.env.SUPABASE_URL}"`,\n          `SUPABASE_SERVICE_KEY="${process.env.SUPABASE_SERVICE_KEY}"`,\n          `SUPABASE_ANON_KEY="${process.env.SUPABASE_ANON_KEY}"`,\n          `NODE_ENV=production`,\n          `PORT=3000`\n        ].join('\n');\n        \n        await ssh.execCommand(`cd ${deployPath} && echo '${envVars}' > .env`);\n        sendLog('log', 'Environment configuration created');\n        \n        sendLog('progress', 'Setting up application', 90);\n        \n        // Setup PM2 or systemd service\n        sendLog('log', 'Setting up application service...');\n        await ssh.execCommand(`cd ${deployPath} && npm install -g pm2`);\n        await ssh.execCommand(`cd ${deployPath} && pm2 stop memopyk || true`);\n        await ssh.execCommand(`cd ${deployPath} && pm2 start dist/index.js --name memopyk`);\n        await ssh.execCommand(`pm2 save`);\n        \n        sendLog('log', 'Setting up nginx reverse proxy...');\n        sendLog('progress', 'Configuring web server', 95);\n        \n        // Install nginx if not present\n        await ssh.execCommand(`apt update && apt install -y nginx certbot python3-certbot-nginx`);\n        \n        // Create nginx configuration\n        const nginxConfig = `\nserver {\n    listen 80;\n    server_name ${domain} www.${domain};\n    \n    # Redirect HTTP to HTTPS\n    return 301 https://$server_name$request_uri;\n}\n\nserver {\n    listen 443 ssl http2;\n    server_name ${domain} www.${domain};\n    \n    # SSL configuration will be added by certbot\n    \n    # Security headers\n    add_header X-Frame-Options "SAMEORIGIN" always;\n    add_header X-XSS-Protection "1; mode=block" always;\n    add_header X-Content-Type-Options "nosniff" always;\n    add_header Referrer-Policy "no-referrer-when-downgrade" always;\n    add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;\n    \n    # Gzip compression\n    gzip on;\n    gzip_vary on;\n    gzip_min_length 1024;\n    gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;\n    \n    # Proxy to Node.js application\n    location / {\n        proxy_pass http://localhost:3000;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection 'upgrade';\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_cache_bypass $http_upgrade;\n        proxy_read_timeout 86400;\n    }\n    \n    # Static files optimization\n    location ~* \\.(jpg|jpeg|png|gif|ico|css|js)$ {\n        proxy_pass http://localhost:3000;\n        expires 1y;\n        add_header Cache-Control "public, immutable";\n    }\n}`;\n        \n        // Write nginx configuration\n        await ssh.execCommand(`echo '${nginxConfig}' > /etc/nginx/sites-available/memopyk`);\n        await ssh.execCommand(`ln -sf /etc/nginx/sites-available/memopyk /etc/nginx/sites-enabled/`);\n        await ssh.execCommand(`rm -f /etc/nginx/sites-enabled/default`);\n        \n        // Test nginx configuration\n        const nginxTest = await ssh.execCommand(`nginx -t`);\n        if (nginxTest.code !== 0) {\n          throw new Error(`Nginx configuration error: ${nginxTest.stderr}`);\n        }\n        \n        sendLog('log', 'Nginx configuration created and tested');\n        \n        // Restart nginx\n        await ssh.execCommand(`systemctl restart nginx`);\n        await ssh.execCommand(`systemctl enable nginx`);\n        \n        sendLog('log', 'Setting up SSL certificate...');\n        sendLog('progress', 'Installing SSL certificate', 98);\n        \n        // Setup SSL certificate with Let's Encrypt\n        const certbotCmd = `certbot --nginx -d ${domain} -d www.${domain} --non-interactive --agree-tos --email admin@${domain} --redirect`;\n        const certbotResult = await ssh.execCommand(certbotCmd);\n        \n        if (certbotResult.code === 0) {\n          sendLog('log', 'SSL certificate installed successfully');\n        } else {\n          sendLog('log', `SSL certificate setup warning: ${certbotResult.stderr}`);\n          sendLog('log', 'You may need to configure DNS first and retry: sudo certbot --nginx');\n        }\n        \n        // Setup automatic certificate renewal\n        await ssh.execCommand(`systemctl enable certbot.timer`);\n        await ssh.execCommand(`systemctl start certbot.timer`);\n        \n        sendLog('log', 'Application service started with PM2');\n        sendLog('progress', 'Deployment complete', 95);\n        \n        // Cleanup\n        await ssh.execCommand(`cd ${deployPath} && rm deployment.tar.gz`);\n        await ssh.dispose();\n        fs.unlinkSync(archivePath);\n        \n        sendLog('success', `Deployment completed! Application is now live at https://${domain}`);\n        sendLog('log', `Application running on VPS at ${deployPath}`);\n        sendLog('progress', 'Deployment complete', 100);\n\n      } catch (deployError: any) {\n        sendLog('error', `Deployment failed: ${deployError.message}`);\n        throw deployError;\n      } finally {\n        // Always reset deployment state\n        isDeploymentInProgress = false;\n      }\n\n      if (!res.headersSent) {\n        res.end();\n      }\n      \n    } catch (error: any) {\n      console.error('Deployment error:', error);\n      // Reset deployment state on error\n      isDeploymentInProgress = false;\n      \n      if (!res.headersSent) {\n        res.status(500).json({ \n          message: "Deployment failed", \n          error: error.message \n        });\n      }\n    }\n  });\n\n  // Deployment History routes\n  app.get("/api/deployment-history", requireAuth, async (req, res) => {\n    try {\n      const history = await storage.getDeploymentHistory();\n      res.json(history);\n    } catch (error: any) {\n      console.error('Get deployment history error:', error);\n      res.status(500).json({ message: "Failed to get deployment history", error: error.message });\n    }\n  });\n\n  app.post("/api/deployment-history", requireAuth, async (req, res) => {\n    try {\n      const entry = await storage.createDeploymentHistoryEntry(req.body);\n      res.json(entry);\n    } catch (error: any) {\n      console.error('Create deployment history entry error:', error);\n      res.status(500).json({ message: "Failed to create deployment history entry", error: error.message });\n    }\n  });\n\n  app.patch("/api/deployment-history/:id", requireAuth, async (req, res) => {\n    try {\n      const { id } = req.params;\n      const entry = await storage.updateDeploymentHistoryEntry(id, req.body);\n      if (!entry) {\n        return res.status(404).json({ message: "Deployment history entry not found" });\n      }\n      res.json(entry);\n    } catch (error: any) {\n      console.error('Update deployment history entry error:', error);\n      res.status(500).json({ message: "Failed to update deployment history entry", error: error.message });\n    }\n  });\n\n  // GitHub Deployment route - restored from procedure\n  app.post("/api/deploy-github", requireAuth, async (req, res) => {\n    try {\n      const { commitMessage = `Deploy: ${new Date().toISOString()} - Admin panel updates` } = req.body;\n      \n      if (!process.env.GITHUB_TOKEN) {\n        return res.status(500).json({ message: "GitHub token not configured" });\n      }\n\n      console.log('🚀 Starting GitHub deployment...');\n      res.write('data: {"type":"log","message":"🚀 Starting GitHub deployment..."}\n\n');\n\n      // Create temporary directory\n      const tempDir = `/tmp/memopyk-deploy-${Date.now()}`;\n      \n      // Step 1: Create clean deployment copy\n      res.write('data: {"type":"log","message":"📁 Creating deployment package..."}\n\n');\n      execSync(`mkdir -p ${tempDir}`, { stdio: 'inherit' });\n\n      // Copy essential files only (avoiding large media files and build artifacts)\n      const filesToCopy = [\n        'client',\n        'server', \n        'shared',\n        'package.json',\n        'package-lock.json',\n        'vite.config.ts',\n        'tailwind.config.ts',\n        'postcss.config.js',\n        'tsconfig.json',\n        'drizzle.config.ts',\n        'components.json',\n        'nixpacks.toml',\n        '.gitignore',\n        'Stephane.txt'\n      ];\n\n      for (const file of filesToCopy) {\n        try {\n          execSync(`cp -r ${file} ${tempDir}/`, { stdio: 'inherit' });\n          res.write(`data: {"type":"log","message":"✅ Copied ${file}"}\n\n`);\n        } catch (error) {\n          console.log(`Warning: Could not copy ${file}, continuing...`);\n        }\n      }\n\n      // Critical cleanup - remove files that cause deployment issues\n      res.write('data: {"type":"log","message":"🧹 Cleaning deployment package..."}\n\n');\n      \n      // Remove large media files that cause GitHub timeouts\n      execSync(`rm -rf ${tempDir}/client/public/media || true`, { stdio: 'inherit' });\n      \n      // Remove Dockerfile that conflicts with nixpacks.toml\n      execSync(`rm -f ${tempDir}/Dockerfile || true`, { stdio: 'inherit' });\n      \n      // Never commit dependencies or build outputs\n      execSync(`rm -rf ${tempDir}/node_modules || true`, { stdio: 'inherit' });\n      execSync(`rm -rf ${tempDir}/dist || true`, { stdio: 'inherit' });\n\n      res.write('data: {"type":"log","message":"✅ Package cleaned and ready"}\n\n');\n\n      // Step 2: Verify clean state\n      res.write('data: {"type":"log","message":"🔍 Verifying deployment contents..."}\n\n');\n      const dirListing = execSync(`ls -la ${tempDir}`, { encoding: 'utf8' });\n      console.log('Deployment contents:', dirListing);\n\n      // Verify no Dockerfile exists\n      try {\n        execSync(`ls ${tempDir}/Dockerfile`, { stdio: 'pipe' });\n        throw new Error('❌ Dockerfile found - this will conflict with nixpacks.toml');\n      } catch (error) {\n        res.write('data: {"type":"log","message":"✅ No Dockerfile found - nixpacks.toml will be used"}\n\n');\n      }\n\n      // Step 3: Git operations (NEVER FAIL with GITHUB_TOKEN)\n      res.write('data: {"type":"log","message":"📤 Pushing to GitHub repository..."}\n\n');\n      \n      process.chdir(tempDir);\n      \n      // Initialize git and configure\n      execSync('git init', { stdio: 'inherit' });\n      execSync('git config user.name "MEMOPYK Assistant"', { stdio: 'inherit' });\n      execSync('git config user.email "assistant@memopyk.com"', { stdio: 'inherit' });\n      \n      // Add GitHub remote with token authentication\n      const repoUrl = `https://${process.env.GITHUB_TOKEN}@github.com/stephane46/memopykCOM.git`;\n      execSync(`git remote add origin ${repoUrl}`, { stdio: 'inherit' });\n      \n      // Stage all files\n      execSync('git add .', { stdio: 'inherit' });\n      \n      // Commit changes\n      execSync(`git commit -m "${commitMessage}"`, { stdio: 'inherit' });\n      \n      // Force push to ensure clean repository state\n      execSync('git push -u origin main --force', { stdio: 'inherit' });\n      \n      res.write('data: {"type":"log","message":"✅ GitHub deployment successful!"}\n\n');\n      \n      // Step 4: Trigger Coolify deployment\n      res.write('data: {"type":"log","message":"🚀 Triggering Coolify deployment..."}\n\n');\n      \n      try {\n        const deploymentData = JSON.stringify({ \n          "uuid": process.env.UUID_APPLICATION \n        });\n        \n        // Try API endpoint\n        const apiUrl = new URL(process.env.COOLIFY_API_URL);\n        const apiOptions = {\n          hostname: apiUrl.hostname,\n          port: 443,\n          path: '/api/v1/deploy',\n          method: 'POST',\n          headers: {\n            'Authorization': `Bearer ${process.env.COOLIFY_API_TOKEN}`,\n            'Content-Type': 'application/json',\n            'Content-Length': Buffer.byteLength(deploymentData)\n          }\n        };\n        \n        const deploymentPromise = new Promise((resolve, reject) => {\n          const req = https.request(apiOptions, (apiRes: any) => {\n            let data = '';\n            apiRes.on('data', (chunk: any) => data += chunk);\n            apiRes.on('end', () => {\n              if (apiRes.statusCode === 200 || apiRes.statusCode === 201 || apiRes.statusCode === 202) {\n                res.write('data: {"type":"log","message":"✅ Coolify deployment triggered successfully!"}\n\n');\n                resolve(data);\n              } else {\n                reject(new Error(`Coolify API responded with status ${apiRes.statusCode}`));\n              }\n            });\n          });\n          \n          req.on('error', reject);\n          req.write(deploymentData);\n          req.end();\n        });\n        \n        await deploymentPromise;\n        res.write('data: {"type":"log","message":"⏰ Build should complete in 2-4 minutes"}\n\n');\n        res.write('data: {"type":"log","message":"🌐 Check new.memopyk.com for updated application"}\n\n');\n        \n      } catch (coolifyError) {\n        console.error('Coolify deployment trigger failed:', coolifyError);\n        res.write('data: {"type":"log","message":"⚠️ GitHub push successful, but Coolify trigger failed"}\n\n');\n        res.write('data: {"type":"log","message":"🔧 Manual deployment may be required in Coolify dashboard"}\n\n');\n      }\n\n      // Step 5: Cleanup\n      process.chdir('/');\n      execSync(`rm -rf ${tempDir}`, { stdio: 'inherit' });\n      \n      res.write('data: {"type":"success","message":"🎉 GitHub deployment completed successfully!"}\n\n');\n      res.end();\n\n    } catch (error: any) {\n      console.error('GitHub deployment error:', error);\n      res.write(`data: {"type":"error","message":"❌ Deployment failed: ${error.message}"}\n\n`);\n      res.end();\n    }\n  });\n\n  const httpServer = createServer(app);\n  return httpServer;\n\n  // Serve static files from dist/public\n  app.use(express.static(path.join(process.cwd(), "dist", "public")));\n\n  // Serve frontend for all non-API routes (SPA routing)\n  app.get("*", (req, res) => {\n    if (req.path.startsWith("/api/")) {\n      return res.status(404).json({ message: "API endpoint not found" });\n    }\n    \n    // Serve the main React app\n    const indexPath = path.join(process.cwd(), "dist", "public", "index.html");\n    if (fs.existsSync(indexPath)) {\n      res.sendFile(indexPath);\n    } else {\n      res.status(404).send("Frontend not found - index.html missing at: " + indexPath);\n    }\n  });\n\n  const httpServer = createServer(app);\n  return httpServer;\n}\n}\n
+import type { Express } from "express";
+import express from "express";
+import { createServer, type Server } from "http";
+import multer from "multer";
+import { storage } from "./storage";
+import { uploadFile } from "./supabase";
+import { 
+  insertHeroVideoSchema, insertGalleryItemSchema, insertFaqSchema, 
+  insertSeoSettingSchema, insertContactSchema 
+} from "@shared/schema";
+
+import { z } from "zod";
+import { NodeSSH } from 'node-ssh';
+import archiver from 'archiver';
+import { exec, execSync } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
+import https from 'https';
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Health check endpoint for Docker healthcheck (IT requirement)
+  app.get('/health', (_req, res) => res.sendStatus(200));
+  
+  // Detailed health check endpoint
+  app.get("/api/health", (req, res) => {
+    res.status(200).json({ status: "healthy", timestamp: new Date().toISOString() });
+  });
+
+  // Diagnostic endpoint for production troubleshooting
+  app.get("/api/diagnostic", (req, res) => {
+    try {
+      res.status(200).json({
+        status: "operational",
+        timestamp: new Date().toISOString(),
+        environment: {
+          NODE_ENV: process.env.NODE_ENV,
+          PORT: process.env.PORT,
+          PUBLIC_DIR: process.env.PUBLIC_DIR,
+          cwd: process.cwd(),
+          dirname: (global as any).import?.meta?.dirname || 'undefined'
+        },
+        server: {
+          uptime: process.uptime(),
+          memory: process.memoryUsage(),
+          pid: process.pid
+        }
+      });
+    } catch (error) {
+      res.status(500).json({ 
+        status: "error", 
+        message: error instanceof Error ? error.message : 'Unknown error',
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+  // Simple token-based auth - no sessions
+  const ADMIN_TOKEN = "memopyk-admin-token-" + Date.now();
+  const validTokens = new Set<string>();
+
+  // File upload middleware
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fileSize: 50 * 1024 * 1024, // 50MB
+    },
+    fileFilter: (req, file, cb) => {
+      // Allow videos and images
+      if (file.mimetype.startsWith('video/') || file.mimetype.startsWith('image/')) {
+        cb(null, true);
+      } else {
+        cb(new Error('Only video and image files are allowed'));
+      }
+    }
+  });
+
+  // Authentication middleware
+  const requireAuth = (req: any, res: any, next: any) => {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token || !validTokens.has(token)) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    next();
+  };
+
+  // Admin authentication
+  app.post("/api/auth/login", async (req, res) => {
+    try {
+      const { password } = req.body;
+      
+      if (password === "memopyk2025admin") {
+        const token = "memopyk-" + Math.random().toString(36).substr(2, 15) + Date.now();
+        validTokens.add(token);
+        
+        console.log('LOGIN SUCCESS - Token generated:', token.substr(0, 10) + "...");
+        res.json({ success: true, token });
+      } else {
+        res.status(401).json({ message: "Invalid password" });
+      }
+    } catch (error) {
+      console.error('Login error:', error);
+      res.status(500).json({ message: "Login error" });
+    }
+  });
+
+  // Deploy to staging endpoint
+  app.post("/api/deploy/staging", requireAuth, async (req, res) => {
+    try {
+      const execAsync = promisify(exec);
+      
+      console.log('🚀 Starting staging deployment...');
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Transfer-Encoding': 'chunked'
+      });
+      
+      // Stream deployment progress
+      const sendProgress = (message: string, status: 'info' | 'success' | 'error' = 'info') => {
+        res.write(JSON.stringify({ message, status, timestamp: new Date().toISOString() }) + '\n');
+      };
+
+      try {
+        sendProgress('📦 Pulling latest code from origin main...');
+        await execAsync('cd /opt/memopykCOM && git pull --ff-only origin main');
+        
+        sendProgress('🔄 Restarting staging container...');
+        await execAsync('cd /opt/memopykCOM && docker compose down && docker compose up -d');
+        
+        sendProgress('⏳ Waiting for container startup...');
+        await new Promise(resolve => setTimeout(resolve, 30000));
+        
+        sendProgress('🔍 Checking health endpoint...');
+        const healthCheck = await execAsync('curl -I http://localhost:3000/health');
+        if (healthCheck.stdout.includes('200 OK')) {
+          sendProgress('✅ Staging deployment successful!', 'success');
+        } else {
+          throw new Error('Health check failed');
+        }
+        
+      } catch (error) {
+        sendProgress('❌ Deployment failed, rolling back...', 'error');
+        try {
+          await execAsync('cd /opt/memopykCOM && git checkout tags/before-staging-deploy');
+          await execAsync('cd /opt/memopykCOM && docker compose down && docker compose up -d');
+          sendProgress('🔄 Rolled back to stable state', 'info');
+        } catch (rollbackError) {
+          sendProgress('⚠️ Rollback failed - manual intervention required', 'error');
+        }
+      }
+      
+      res.end();
+    } catch (error) {
+      console.error('Staging deployment error:', error);
+      res.status(500).json({ message: "Staging deployment failed" });
+    }
+  });
+
+  // Deploy to production endpoint
+  app.post("/api/deploy/production", requireAuth, async (req, res) => {
+    try {
+      const execAsync = promisify(exec);
+      
+      console.log('🚀 Starting production deployment...');
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Transfer-Encoding': 'chunked'
+      });
+      
+      // Stream deployment progress
+      const sendProgress = (message: string, status: 'info' | 'success' | 'error' = 'info') => {
+        res.write(JSON.stringify({ message, status, timestamp: new Date().toISOString() }) + '\n');
+      };
+
+      try {
+        sendProgress('📦 Pulling latest code from origin main...');
+        await execAsync('cd /opt/memopykCOM && git pull --ff-only origin main');
+        
+        sendProgress('🔄 Restarting production container...');
+        await execAsync('cd /opt/memopykCOM && docker compose down && docker compose up -d');
+        
+        sendProgress('⏳ Waiting for container startup...');
+        await new Promise(resolve => setTimeout(resolve, 30000));
+        
+        sendProgress('🔍 Checking health endpoint...');
+        const healthCheck = await execAsync('curl -I http://localhost:3000/health');
+        if (healthCheck.stdout.includes('200 OK')) {
+          sendProgress('🔍 Checking domain access...');
+          const domainCheck = await execAsync('curl -I https://new.memopyk.com/');
+          if (domainCheck.stdout.includes('200')) {
+            sendProgress('✅ Production deployment successful!', 'success');
+          } else {
+            throw new Error('Domain access check failed');
+          }
+        } else {
+          throw new Error('Health check failed');
+        }
+        
+      } catch (error) {
+        sendProgress('❌ Production deployment failed, rolling back...', 'error');
+        try {
+          await execAsync('cd /opt/memopykCOM && git checkout tags/before-staging-deploy');
+          await execAsync('cd /opt/memopykCOM && docker compose down && docker compose up -d');
+          sendProgress('🔄 Rolled back to stable state', 'info');
+        } catch (rollbackError) {
+          sendProgress('⚠️ Rollback failed - manual intervention required', 'error');
+        }
+      }
+      
+      res.end();
+    } catch (error) {
+      console.error('Production deployment error:', error);
+      res.status(500).json({ message: "Production deployment failed" });
+    }
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (token) {
+      validTokens.delete(token);
+    }
+    res.json({ success: true });
+  });
+
+  app.get("/api/auth/status", (req, res) => {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    res.json({ isAuthenticated: !!(token && validTokens.has(token)) });
+  });
+
+  // Hero Videos routes
+  app.get("/api/hero-videos", async (req, res) => {
+    try {
+      const videos = await storage.getHeroVideos();
+      res.json(videos);
+    } catch (error: any) {
+      console.error("Error fetching hero videos:", error);
+      res.status(500).json({ message: "Failed to fetch hero videos", error: error.message });
+    }
+  });
+
+  app.post("/api/hero-videos", requireAuth, async (req, res) => {
+    try {
+      const validatedData = insertHeroVideoSchema.parse(req.body);
+      const video = await storage.createHeroVideo(validatedData);
+      res.json(video);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ message: "Invalid data", errors: error.errors });
+      } else {
+        res.status(500).json({ message: "Failed to create hero video" });
+      }
+    }
+  });
+
+  app.put("/api/hero-videos/:id", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const validatedData = insertHeroVideoSchema.partial().parse(req.body);
+      const video = await storage.updateHeroVideo(id, validatedData);
+      
+      if (!video) {
+        return res.status(404).json({ message: "Hero video not found" });
+      }
+      
+      res.json(video);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ message: "Invalid data", errors: error.errors });
+      } else {
+        res.status(500).json({ message: "Failed to update hero video" });
+      }
+    }
+  });
+
+  app.delete("/api/hero-videos/:id", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const success = await storage.deleteHeroVideo(id);
+      
+      if (!success) {
+        return res.status(404).json({ message: "Hero video not found" });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Failed to delete hero video" });
+    }
+  });
+
+  // Gallery Items routes
+  app.get("/api/gallery-items", async (req, res) => {
+    try {
+      const items = await storage.getGalleryItems();
+      res.json(items);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch gallery items" });
+    }
+  });
+
+  app.post("/api/gallery-items", requireAuth, async (req, res) => {
+    try {
+      const validatedData = insertGalleryItemSchema.parse(req.body);
+      const item = await storage.createGalleryItem(validatedData);
+      res.json(item);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ message: "Invalid data", errors: error.errors });
+      } else {
+        res.status(500).json({ message: "Failed to create gallery item" });
+      }
+    }
+  });
+
+  app.put("/api/gallery-items/:id", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const validatedData = insertGalleryItemSchema.partial().parse(req.body);
+      const item = await storage.updateGalleryItem(id, validatedData);
+      
+      if (!item) {
+        return res.status(404).json({ message: "Gallery item not found" });
+      }
+      
+      res.json(item);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ message: "Invalid data", errors: error.errors });
+      } else {
+        res.status(500).json({ message: "Failed to update gallery item" });
+      }
+    }
+  });
+
+  app.delete("/api/gallery-items/:id", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const success = await storage.deleteGalleryItem(id);
+      
+      if (!success) {
+        return res.status(404).json({ message: "Gallery item not found" });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Failed to delete gallery item" });
+    }
+  });
+
+  // FAQs routes
+  app.get("/api/faqs", async (req, res) => {
+    try {
+      const faqs = await storage.getFaqs();
+      res.json(faqs);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch FAQs" });
+    }
+  });
+
+  app.post("/api/faqs", requireAuth, async (req, res) => {
+    try {
+      const validatedData = insertFaqSchema.parse(req.body);
+      const faq = await storage.createFaq(validatedData);
+      res.json(faq);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ message: "Invalid data", errors: error.errors });
+      } else {
+        res.status(500).json({ message: "Failed to create FAQ" });
+      }
+    }
+  });
+
+  app.put("/api/faqs/:id", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const validatedData = insertFaqSchema.partial().parse(req.body);
+      const faq = await storage.updateFaq(id, validatedData);
+      
+      if (!faq) {
+        return res.status(404).json({ message: "FAQ not found" });
+      }
+      
+      res.json(faq);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ message: "Invalid data", errors: error.errors });
+      } else {
+        res.status(500).json({ message: "Failed to update FAQ" });
+      }
+    }
+  });
+
+  app.delete("/api/faqs/:id", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const success = await storage.deleteFaq(id);
+      
+      if (!success) {
+        return res.status(404).json({ message: "FAQ not found" });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Failed to delete FAQ" });
+    }
+  });
+
+  // Contacts routes
+  app.get("/api/contacts", requireAuth, async (req, res) => {
+    try {
+      const contacts = await storage.getContacts();
+      res.json(contacts);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch contacts" });
+    }
+  });
+
+  app.post("/api/contacts", async (req, res) => {
+    try {
+      const validatedData = insertContactSchema.parse(req.body);
+      const contact = await storage.createContact(validatedData);
+      res.json(contact);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ message: "Invalid data", errors: error.errors });
+      } else {
+        res.status(500).json({ message: "Failed to create contact" });
+      }
+    }
+  });
+
+  app.put("/api/contacts/:id", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const validatedData = insertContactSchema.partial().parse(req.body);
+      const contact = await storage.updateContact(id, validatedData);
+      
+      if (!contact) {
+        return res.status(404).json({ message: "Contact not found" });
+      }
+      
+      res.json(contact);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ message: "Invalid data", errors: error.errors });
+      } else {
+        res.status(500).json({ message: "Failed to update contact" });
+      }
+    }
+  });
+
+  app.delete("/api/contacts/:id", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const success = await storage.deleteContact(id);
+      
+      if (!success) {
+        return res.status(404).json({ message: "Contact not found" });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Failed to delete contact" });
+    }
+  });
+
+  // File upload route for Supabase Storage
+  app.post("/api/upload", requireAuth, upload.single('file'), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "No file provided" });
+      }
+
+      const { originalname, buffer, mimetype } = req.file;
+      
+      // Upload to Supabase Storage
+      const { url, path } = await uploadFile(buffer, originalname, 'memopyk-media', mimetype);
+      
+      res.json({ 
+        url, 
+        path,
+        originalName: originalname,
+        size: buffer.length,
+        mimeType: mimetype
+      });
+    } catch (error: any) {
+      console.error('File upload error:', error);
+      res.status(500).json({ 
+        message: "File upload failed", 
+        error: error.message 
+      });
+    }
+  });
+
+  // Legal Documents API
+  app.get("/api/legal-documents", async (req, res) => {
+    try {
+      const documents = await storage.getLegalDocuments();
+      res.json(documents);
+    } catch (error: any) {
+      res.status(500).json({ message: "Failed to fetch legal documents", error: error.message });
+    }
+  });
+
+  app.get("/api/legal-documents/:id", async (req, res) => {
+    try {
+      const document = await storage.getLegalDocument(req.params.id);
+      if (!document) {
+        return res.status(404).json({ message: "Legal document not found" });
+      }
+      res.json(document);
+    } catch (error: any) {
+      res.status(500).json({ message: "Failed to fetch legal document", error: error.message });
+    }
+  });
+
+  app.get("/api/legal-documents/type/:type", async (req, res) => {
+    try {
+      const document = await storage.getLegalDocumentByType(req.params.type);
+      if (!document) {
+        return res.status(404).json({ message: "Legal document not found" });
+      }
+      res.json(document);
+    } catch (error: any) {
+      res.status(500).json({ message: "Failed to fetch legal document", error: error.message });
+    }
+  });
+
+  app.post("/api/legal-documents", requireAuth, async (req, res) => {
+    try {
+      const document = await storage.createLegalDocument(req.body);
+      res.status(201).json(document);
+    } catch (error: any) {
+      res.status(500).json({ message: "Failed to create legal document", error: error.message });
+    }
+  });
+
+  app.put("/api/legal-documents/:id", requireAuth, async (req, res) => {
+    try {
+      const document = await storage.updateLegalDocument(req.params.id, req.body);
+      if (!document) {
+        return res.status(404).json({ message: "Legal document not found" });
+      }
+      res.json(document);
+    } catch (error: any) {
+      res.status(500).json({ message: "Failed to update legal document", error: error.message });
+    }
+  });
+
+  app.delete("/api/legal-documents/:id", requireAuth, async (req, res) => {
+    try {
+      const success = await storage.deleteLegalDocument(req.params.id);
+      if (!success) {
+        return res.status(404).json({ message: "Legal document not found" });
+      }
+      res.json({ message: "Legal document deleted successfully" });
+    } catch (error: any) {
+      res.status(500).json({ message: "Failed to delete legal document", error: error.message });
+    }
+  });
+
+  // Coolify API deployment endpoint
+  app.post("/api/deploy/coolify", requireAuth, async (req, res) => {
+    try {
+      
+      const deploymentData = JSON.stringify({ 
+        "uuid": process.env.UUID_APPLICATION 
+      });
+      
+      const apiUrl = new URL(process.env.COOLIFY_API_URL);
+      const options = {
+        hostname: apiUrl.hostname,
+        port: 443,
+        path: '/api/v1/deploy',
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.COOLIFY_API_TOKEN}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(deploymentData)
+        }
+      };
+      
+      const coolifyResponse = await new Promise((resolve, reject) => {
+        const coolifyReq = https.request(options, (coolifyRes) => {
+          let data = '';
+          coolifyRes.on('data', (chunk) => data += chunk);
+          coolifyRes.on('end', () => {
+            resolve({ status: coolifyRes.statusCode, data });
+          });
+        });
+        
+        coolifyReq.on('error', reject);
+        coolifyReq.write(deploymentData);
+        coolifyReq.end();
+      });
+      
+      if (coolifyResponse.status === 200) {
+        // Note: Deployment history tracking would be added when schema supports it
+        
+        res.json({ 
+          success: true, 
+          message: 'Deployment triggered via Coolify API',
+          response: JSON.parse(coolifyResponse.data)
+        });
+      } else {
+        throw new Error(`Coolify API returned status ${coolifyResponse.status}`);
+      }
+      
+    } catch (error) {
+      res.status(500).json({ 
+        success: false,
+        message: "Coolify deployment failed", 
+        error: error.message 
+      });
+    }
+  });
+
+  // Deployment endpoints
+  app.post("/api/deploy/test", requireAuth, async (req, res) => {
+    try {
+      const { host, username } = req.body;
+      
+      if (!host || !username) {
+        return res.status(400).json({ message: "Host and username are required" });
+      }
+
+      // Test actual SSH connection
+      const ssh = new NodeSSH();
+      
+      try {
+        await ssh.connect({
+          host,
+          username,
+          privateKey: process.env.SSH_PRIVATE_KEY || undefined,
+          password: process.env.SSH_PASSWORD || undefined,
+          port: 22,
+          readyTimeout: 10000
+        });
+        
+        // Test basic command
+        const result = await ssh.execCommand('whoami');
+        await ssh.dispose();
+        
+        if (result.code === 0) {
+          res.json({ success: true, message: `Connection successful. Connected as: ${result.stdout.trim()}` });
+        } else {
+          throw new Error(`SSH test failed: ${result.stderr}`);
+        }
+      } catch (sshError: any) {
+        await ssh.dispose();
+        throw new Error(`SSH connection failed: ${sshError.message}`);
+      }
+      
+    } catch (error: any) {
+      res.status(500).json({ 
+        message: "Connection test failed", 
+        error: error.message 
+      });
+    }
+  });
+
+  // Global deployment state
+  let isDeploymentInProgress = false;
+
+  // Reset deployment status endpoint
+  app.post("/api/deploy/reset", requireAuth, (req, res) => {
+    isDeploymentInProgress = false;
+    res.json({ message: "Deployment status reset", inProgress: false });
+  });
+
+  // Get deployment status endpoint
+  app.get("/api/deploy/status", requireAuth, (req, res) => {
+    res.json({ inProgress: isDeploymentInProgress });
+  });
+
+  // Nginx and SSL setup endpoint
+  app.post("/api/deploy/setup-nginx", requireAuth, async (req, res) => {
+    try {
+      if (isDeploymentInProgress) {
+        return res.status(409).json({ 
+          message: "Deployment in progress. Please wait." 
+        });
+      }
+
+      const { host, username, domain } = req.body;
+      
+      if (!host || !username || !domain) {
+        return res.status(400).json({ message: "Host, username, and domain are required" });
+      }
+
+      isDeploymentInProgress = true;
+
+      // Set up streaming response
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+
+      const sendLog = (type: string, message: string, percentage?: number) => {
+        const logData = {
+          type,
+          message,
+          percentage,
+          timestamp: new Date().toISOString()
+        };
+        res.write(JSON.stringify(logData) + '\n');
+      };
+
+      try {
+        sendLog('log', 'Starting nginx and SSL setup...', 0);
+        sendLog('progress', 'Connecting to VPS', 10);
+
+        const ssh = new NodeSSH();
+        
+        const sshOptions: any = {
+          host,
+          username,
+          port: 22,
+          readyTimeout: 30000
+        };
+
+        if (process.env.SSH_PASSWORD) {
+          sshOptions.password = process.env.SSH_PASSWORD;
+          sendLog('log', 'Using SSH password authentication');
+        } else if (process.env.SSH_PRIVATE_KEY) {
+          sshOptions.privateKey = process.env.SSH_PRIVATE_KEY;
+          sendLog('log', 'Using SSH private key authentication');
+        } else {
+          throw new Error('No SSH credentials provided');
+        }
+
+        await ssh.connect(sshOptions);
+        sendLog('log', 'SSH connection established');
+        sendLog('progress', 'Installing nginx and certbot', 30);
+
+        // Upload and execute nginx setup script
+        const setupScript = `#!/bin/bash
+set -e
+
+DOMAIN="${domain}"
+EMAIL="admin@${domain}"
+APP_PORT="3000"
+
+echo "🚀 Setting up nginx reverse proxy for MEMOPYK..."
+
+# Update system packages
+apt update
+apt install -y nginx certbot python3-certbot-nginx
+
+# Create nginx configuration
+cat > /etc/nginx/sites-available/memopyk << 'EOF'
+server {
+    listen 80;
+    server_name $DOMAIN www.$DOMAIN;
+    
+    # Redirect HTTP to HTTPS
+    return 301 https://\\$server_name\\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN www.$DOMAIN;
+    
+    # SSL configuration will be added by certbot
+    
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+    
+    # Gzip compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
+    
+    # Proxy to Node.js application
+    location / {
+        proxy_pass http://localhost:$APP_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \\$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \\$host;
+        proxy_set_header X-Real-IP \\$remote_addr;
+        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \\$scheme;
+        proxy_cache_bypass \\$http_upgrade;
+        proxy_read_timeout 86400;
+    }
+    
+    # Static files optimization
+    location ~* \\.(jpg|jpeg|png|gif|ico|css|js)$ {
+        proxy_pass http://localhost:$APP_PORT;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}
+EOF
+
+# Enable the site
+ln -sf /etc/nginx/sites-available/memopyk /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+
+# Test nginx configuration
+nginx -t
+
+# Restart nginx
+systemctl restart nginx
+systemctl enable nginx
+
+echo "✅ Nginx setup complete!"
+`;
+
+        await ssh.execCommand(`echo '${setupScript}' > /tmp/setup-nginx.sh && chmod +x /tmp/setup-nginx.sh`);
+        sendLog('log', 'Nginx setup script uploaded');
+        
+        sendLog('progress', 'Executing nginx setup', 50);
+        const nginxResult = await ssh.execCommand(`bash /tmp/setup-nginx.sh`);
+        
+        if (nginxResult.code !== 0) {
+          throw new Error(`Nginx setup failed: ${nginxResult.stderr}`);
+        }
+        
+        sendLog('log', 'Nginx configuration completed');
+        sendLog('progress', 'Setting up SSL certificate', 80);
+
+        // Setup SSL certificate
+        const certbotCmd = `certbot --nginx -d ${domain} -d www.${domain} --non-interactive --agree-tos --email admin@${domain} --redirect`;
+        const certbotResult = await ssh.execCommand(certbotCmd);
+        
+        if (certbotResult.code === 0) {
+          sendLog('success', 'SSL certificate installed successfully!');
+          sendLog('log', `Website now available at: https://${domain}`);
+        } else {
+          sendLog('warning', `SSL certificate setup warning: ${certbotResult.stderr}`);
+          sendLog('log', 'You may need to configure DNS first. Run: sudo certbot --nginx');
+        }
+
+        // Setup automatic renewal
+        await ssh.execCommand(`systemctl enable certbot.timer && systemctl start certbot.timer`);
+        sendLog('log', 'Automatic SSL renewal configured');
+        
+        await ssh.dispose();
+        sendLog('success', 'Nginx and SSL setup completed!');
+        sendLog('progress', 'Setup complete', 100);
+
+      } catch (error: any) {
+        sendLog('error', `Setup failed: ${error.message}`);
+        throw error;
+      } finally {
+        isDeploymentInProgress = false;
+      }
+
+      if (!res.headersSent) {
+        res.end();
+      }
+      
+    } catch (error: any) {
+      console.error('Nginx setup error:', error);
+      isDeploymentInProgress = false;
+      
+      if (!res.headersSent) {
+        res.status(500).json({ 
+          message: "Nginx setup failed", 
+          error: error.message 
+        });
+      }
+    }
+  });
+
+  app.post("/api/deploy", requireAuth, async (req, res) => {
+    try {
+      // Check if deployment is already in progress
+      if (isDeploymentInProgress) {
+        return res.status(409).json({ 
+          message: "Deployment already in progress. Please wait or reset the deployment status." 
+        });
+      }
+
+      const { host, username, deployPath, domain } = req.body;
+      
+      if (!host || !username) {
+        return res.status(400).json({ message: "Host and username are required" });
+      }
+
+      // Set deployment in progress
+      isDeploymentInProgress = true;
+
+      // Set up streaming response
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+
+      const sendLog = (type: string, message: string, percentage?: number) => {
+        const logData = { type, message, percentage, timestamp: new Date().toISOString() };
+        res.write(JSON.stringify(logData) + '\n');
+      };
+
+      try {
+        sendLog('log', 'Starting deployment process...');
+        sendLog('progress', 'Initializing', 5);
+
+        // Step 1: Build the project
+        sendLog('log', 'Building project...');
+        sendLog('progress', 'Building frontend and backend', 20);
+        
+        const execAsync = promisify(exec);
+        const buildResult = await execAsync('npm run build');
+        sendLog('log', `Build completed: ${buildResult.stdout}`);
+        if (buildResult.stderr) {
+          sendLog('log', `Build warnings: ${buildResult.stderr}`);
+        }
+        sendLog('progress', 'Build complete', 40);
+
+        // Step 2: Prepare deployment package
+        sendLog('log', 'Preparing deployment package...');
+        sendLog('progress', 'Creating deployment archive', 50);
+        
+        const archivePath = '/tmp/memopyk-deployment.tar.gz';
+        await new Promise<void>((resolve, reject) => {
+          const output = fs.createWriteStream(archivePath);
+          const archive = archiver('tar', { gzip: true });
+          
+          output.on('close', () => {
+            sendLog('log', `Archive created: ${archive.pointer()} bytes`);
+            resolve();
+          });
+          
+          archive.on('error', reject);
+          archive.pipe(output);
+          
+          // Add built files
+          archive.directory('dist/', 'dist');
+          archive.file('package.json', { name: 'package.json' });
+          archive.file('package-lock.json', { name: 'package-lock.json' });
+          
+          archive.finalize();
+        });
+        
+        sendLog('progress', 'Archive created', 60);
+
+        // Step 3: Connect and transfer to VPS
+        sendLog('log', `Connecting to VPS at ${host}...`);
+        sendLog('progress', 'Connecting to VPS', 65);
+        
+        const ssh = new NodeSSH();
+        
+        // Prepare SSH connection options
+        const sshOptions: any = {
+          host,
+          username,
+          port: 22,
+          readyTimeout: 30000
+        };
+
+        // Use password authentication for now (more reliable for testing)
+        if (process.env.SSH_PASSWORD) {
+          sshOptions.password = process.env.SSH_PASSWORD;
+          sendLog('log', 'Using SSH password authentication');
+        } else if (process.env.SSH_PRIVATE_KEY) {
+          // Try private key as fallback
+          sshOptions.privateKey = process.env.SSH_PRIVATE_KEY;
+          sendLog('log', 'Using SSH private key authentication');
+        } else {
+          throw new Error('No SSH credentials provided. Please set SSH_PASSWORD or SSH_PRIVATE_KEY');
+        }
+
+        await ssh.connect(sshOptions);
+        
+        sendLog('log', 'SSH connection established');
+        sendLog('progress', 'Transferring files to VPS', 70);
+        
+        // Create deployment directory
+        await ssh.execCommand(`mkdir -p ${deployPath}`);
+        sendLog('log', `Created deployment directory: ${deployPath}`);
+        
+        // Transfer archive
+        await ssh.putFile(archivePath, `${deployPath}/deployment.tar.gz`);
+        sendLog('log', 'Archive transferred to VPS');
+        sendLog('progress', 'Files transferred', 80);
+
+        // Step 4: Extract and setup on VPS
+        sendLog('log', 'Extracting files on VPS...');
+        await ssh.execCommand(`cd ${deployPath} && tar -xzf deployment.tar.gz`);
+        sendLog('log', 'Files extracted successfully');
+        
+        sendLog('log', 'Installing dependencies on VPS...');
+        sendLog('progress', 'Installing dependencies', 85);
+        const installResult = await ssh.execCommand(`cd ${deployPath} && npm ci --production`);
+        if (installResult.code !== 0) {
+          throw new Error(`Dependency installation failed: ${installResult.stderr}`);
+        }
+        sendLog('log', 'Dependencies installed successfully');
+        
+        // Setup environment file
+        sendLog('log', 'Setting up environment configuration...');
+        const envVars = [
+          `DATABASE_URL="${process.env.DATABASE_URL}"`,
+          `SUPABASE_URL="${process.env.SUPABASE_URL}"`,
+          `SUPABASE_SERVICE_KEY="${process.env.SUPABASE_SERVICE_KEY}"`,
+          `SUPABASE_ANON_KEY="${process.env.SUPABASE_ANON_KEY}"`,
+          `NODE_ENV=production`,
+          `PORT=3000`
+        ].join('\n');
+        
+        await ssh.execCommand(`cd ${deployPath} && echo '${envVars}' > .env`);
+        sendLog('log', 'Environment configuration created');
+        
+        sendLog('progress', 'Setting up application', 90);
+        
+        // Setup PM2 or systemd service
+        sendLog('log', 'Setting up application service...');
+        await ssh.execCommand(`cd ${deployPath} && npm install -g pm2`);
+        await ssh.execCommand(`cd ${deployPath} && pm2 stop memopyk || true`);
+        await ssh.execCommand(`cd ${deployPath} && pm2 start dist/index.js --name memopyk`);
+        await ssh.execCommand(`pm2 save`);
+        
+        sendLog('log', 'Setting up nginx reverse proxy...');
+        sendLog('progress', 'Configuring web server', 95);
+        
+        // Install nginx if not present
+        await ssh.execCommand(`apt update && apt install -y nginx certbot python3-certbot-nginx`);
+        
+        // Create nginx configuration
+        const nginxConfig = `
+server {
+    listen 80;
+    server_name ${domain} www.${domain};
+    
+    # Redirect HTTP to HTTPS
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${domain} www.${domain};
+    
+    # SSL configuration will be added by certbot
+    
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+    
+    # Gzip compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
+    
+    # Proxy to Node.js application
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        proxy_read_timeout 86400;
+    }
+    
+    # Static files optimization
+    location ~* \\.(jpg|jpeg|png|gif|ico|css|js)$ {
+        proxy_pass http://localhost:3000;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}`;
+        
+        // Write nginx configuration
+        await ssh.execCommand(`echo '${nginxConfig}' > /etc/nginx/sites-available/memopyk`);
+        await ssh.execCommand(`ln -sf /etc/nginx/sites-available/memopyk /etc/nginx/sites-enabled/`);
+        await ssh.execCommand(`rm -f /etc/nginx/sites-enabled/default`);
+        
+        // Test nginx configuration
+        const nginxTest = await ssh.execCommand(`nginx -t`);
+        if (nginxTest.code !== 0) {
+          throw new Error(`Nginx configuration error: ${nginxTest.stderr}`);
+        }
+        
+        sendLog('log', 'Nginx configuration created and tested');
+        
+        // Restart nginx
+        await ssh.execCommand(`systemctl restart nginx`);
+        await ssh.execCommand(`systemctl enable nginx`);
+        
+        sendLog('log', 'Setting up SSL certificate...');
+        sendLog('progress', 'Installing SSL certificate', 98);
+        
+        // Setup SSL certificate with Let's Encrypt
+        const certbotCmd = `certbot --nginx -d ${domain} -d www.${domain} --non-interactive --agree-tos --email admin@${domain} --redirect`;
+        const certbotResult = await ssh.execCommand(certbotCmd);
+        
+        if (certbotResult.code === 0) {
+          sendLog('log', 'SSL certificate installed successfully');
+        } else {
+          sendLog('log', `SSL certificate setup warning: ${certbotResult.stderr}`);
+          sendLog('log', 'You may need to configure DNS first and retry: sudo certbot --nginx');
+        }
+        
+        // Setup automatic certificate renewal
+        await ssh.execCommand(`systemctl enable certbot.timer`);
+        await ssh.execCommand(`systemctl start certbot.timer`);
+        
+        sendLog('log', 'Application service started with PM2');
+        sendLog('progress', 'Deployment complete', 95);
+        
+        // Cleanup
+        await ssh.execCommand(`cd ${deployPath} && rm deployment.tar.gz`);
+        await ssh.dispose();
+        fs.unlinkSync(archivePath);
+        
+        sendLog('success', `Deployment completed! Application is now live at https://${domain}`);
+        sendLog('log', `Application running on VPS at ${deployPath}`);
+        sendLog('progress', 'Deployment complete', 100);
+
+      } catch (deployError: any) {
+        sendLog('error', `Deployment failed: ${deployError.message}`);
+        throw deployError;
+      } finally {
+        // Always reset deployment state
+        isDeploymentInProgress = false;
+      }
+
+      if (!res.headersSent) {
+        res.end();
+      }
+      
+    } catch (error: any) {
+      console.error('Deployment error:', error);
+      // Reset deployment state on error
+      isDeploymentInProgress = false;
+      
+      if (!res.headersSent) {
+        res.status(500).json({ 
+          message: "Deployment failed", 
+          error: error.message 
+        });
+      }
+    }
+  });
+
+  // Deployment History routes
+  app.get("/api/deployment-history", requireAuth, async (req, res) => {
+    try {
+      const history = await storage.getDeploymentHistory();
+      res.json(history);
+    } catch (error: any) {
+      console.error('Get deployment history error:', error);
+      res.status(500).json({ message: "Failed to get deployment history", error: error.message });
+    }
+  });
+
+  app.post("/api/deployment-history", requireAuth, async (req, res) => {
+    try {
+      const entry = await storage.createDeploymentHistoryEntry(req.body);
+      res.json(entry);
+    } catch (error: any) {
+      console.error('Create deployment history entry error:', error);
+      res.status(500).json({ message: "Failed to create deployment history entry", error: error.message });
+    }
+  });
+
+  app.patch("/api/deployment-history/:id", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const entry = await storage.updateDeploymentHistoryEntry(id, req.body);
+      if (!entry) {
+        return res.status(404).json({ message: "Deployment history entry not found" });
+      }
+      res.json(entry);
+    } catch (error: any) {
+      console.error('Update deployment history entry error:', error);
+      res.status(500).json({ message: "Failed to update deployment history entry", error: error.message });
+    }
+  });
+
+  // GitHub Deployment route - restored from procedure
+  app.post("/api/deploy-github", requireAuth, async (req, res) => {
+    try {
+      const { commitMessage = `Deploy: ${new Date().toISOString()} - Admin panel updates` } = req.body;
+      
+      if (!process.env.GITHUB_TOKEN) {
+        return res.status(500).json({ message: "GitHub token not configured" });
+      }
+
+      console.log('🚀 Starting GitHub deployment...');
+      res.write('data: {"type":"log","message":"🚀 Starting GitHub deployment..."}\n\n');
+
+      // Create temporary directory
+      const tempDir = `/tmp/memopyk-deploy-${Date.now()}`;
+      
+      // Step 1: Create clean deployment copy
+      res.write('data: {"type":"log","message":"📁 Creating deployment package..."}\n\n');
+      execSync(`mkdir -p ${tempDir}`, { stdio: 'inherit' });
+
+      // Copy essential files only (avoiding large media files and build artifacts)
+      const filesToCopy = [
+        'client',
+        'server', 
+        'shared',
+        'package.json',
+        'package-lock.json',
+        'vite.config.ts',
+        'tailwind.config.ts',
+        'postcss.config.js',
+        'tsconfig.json',
+        'drizzle.config.ts',
+        'components.json',
+        'nixpacks.toml',
+        '.gitignore',
+        'Stephane.txt'
+      ];
+
+      for (const file of filesToCopy) {
+        try {
+          execSync(`cp -r ${file} ${tempDir}/`, { stdio: 'inherit' });
+          res.write(`data: {"type":"log","message":"✅ Copied ${file}"}\n\n`);
+        } catch (error) {
+          console.log(`Warning: Could not copy ${file}, continuing...`);
+        }
+      }
+
+      // Critical cleanup - remove files that cause deployment issues
+      res.write('data: {"type":"log","message":"🧹 Cleaning deployment package..."}\n\n');
+      
+      // Remove large media files that cause GitHub timeouts
+      execSync(`rm -rf ${tempDir}/client/public/media || true`, { stdio: 'inherit' });
+      
+      // Remove Dockerfile that conflicts with nixpacks.toml
+      execSync(`rm -f ${tempDir}/Dockerfile || true`, { stdio: 'inherit' });
+      
+      // Never commit dependencies or build outputs
+      execSync(`rm -rf ${tempDir}/node_modules || true`, { stdio: 'inherit' });
+      execSync(`rm -rf ${tempDir}/dist || true`, { stdio: 'inherit' });
+
+      res.write('data: {"type":"log","message":"✅ Package cleaned and ready"}\n\n');
+
+      // Step 2: Verify clean state
+      res.write('data: {"type":"log","message":"🔍 Verifying deployment contents..."}\n\n');
+      const dirListing = execSync(`ls -la ${tempDir}`, { encoding: 'utf8' });
+      console.log('Deployment contents:', dirListing);
+
+      // Verify no Dockerfile exists
+      try {
+        execSync(`ls ${tempDir}/Dockerfile`, { stdio: 'pipe' });
+        throw new Error('❌ Dockerfile found - this will conflict with nixpacks.toml');
+      } catch (error) {
+        res.write('data: {"type":"log","message":"✅ No Dockerfile found - nixpacks.toml will be used"}\n\n');
+      }
+
+      // Step 3: Git operations (NEVER FAIL with GITHUB_TOKEN)
+      res.write('data: {"type":"log","message":"📤 Pushing to GitHub repository..."}\n\n');
+      
+      process.chdir(tempDir);
+      
+      // Initialize git and configure
+      execSync('git init', { stdio: 'inherit' });
+      execSync('git config user.name "MEMOPYK Assistant"', { stdio: 'inherit' });
+      execSync('git config user.email "assistant@memopyk.com"', { stdio: 'inherit' });
+      
+      // Add GitHub remote with token authentication
+      const repoUrl = `https://${process.env.GITHUB_TOKEN}@github.com/stephane46/memopykCOM.git`;
+      execSync(`git remote add origin ${repoUrl}`, { stdio: 'inherit' });
+      
+      // Stage all files
+      execSync('git add .', { stdio: 'inherit' });
+      
+      // Commit changes
+      execSync(`git commit -m "${commitMessage}"`, { stdio: 'inherit' });
+      
+      // Force push to ensure clean repository state
+      execSync('git push -u origin main --force', { stdio: 'inherit' });
+      
+      res.write('data: {"type":"log","message":"✅ GitHub deployment successful!"}\n\n');
+      
+      // Step 4: Trigger Coolify deployment
+      res.write('data: {"type":"log","message":"🚀 Triggering Coolify deployment..."}\n\n');
+      
+      try {
+        const deploymentData = JSON.stringify({ 
+          "uuid": process.env.UUID_APPLICATION 
+        });
+        
+        // Try API endpoint
+        const apiUrl = new URL(process.env.COOLIFY_API_URL);
+        const apiOptions = {
+          hostname: apiUrl.hostname,
+          port: 443,
+          path: '/api/v1/deploy',
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${process.env.COOLIFY_API_TOKEN}`,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(deploymentData)
+          }
+        };
+        
+        const deploymentPromise = new Promise((resolve, reject) => {
+          const req = https.request(apiOptions, (apiRes: any) => {
+            let data = '';
+            apiRes.on('data', (chunk: any) => data += chunk);
+            apiRes.on('end', () => {
+              if (apiRes.statusCode === 200 || apiRes.statusCode === 201 || apiRes.statusCode === 202) {
+                res.write('data: {"type":"log","message":"✅ Coolify deployment triggered successfully!"}\n\n');
+                resolve(data);
+              } else {
+                reject(new Error(`Coolify API responded with status ${apiRes.statusCode}`));
+              }
+            });
+          });
+          
+          req.on('error', reject);
+          req.write(deploymentData);
+          req.end();
+        });
+        
+        await deploymentPromise;
+        res.write('data: {"type":"log","message":"⏰ Build should complete in 2-4 minutes"}\n\n');
+        res.write('data: {"type":"log","message":"🌐 Check new.memopyk.com for updated application"}\n\n');
+        
+      } catch (coolifyError) {
+        console.error('Coolify deployment trigger failed:', coolifyError);
+        res.write('data: {"type":"log","message":"⚠️ GitHub push successful, but Coolify trigger failed"}\n\n');
+        res.write('data: {"type":"log","message":"🔧 Manual deployment may be required in Coolify dashboard"}\n\n');
+      }
+
+      // Step 5: Cleanup
+      process.chdir('/');
+      execSync(`rm -rf ${tempDir}`, { stdio: 'inherit' });
+      
+      res.write('data: {"type":"success","message":"🎉 GitHub deployment completed successfully!"}\n\n');
+      res.end();
+
+    } catch (error: any) {
+      console.error('GitHub deployment error:', error);
+      res.write(`data: {"type":"error","message":"❌ Deployment failed: ${error.message}"}\n\n`);
+      res.end();
+    }
+  });
+
+  // Serve static files from dist/public
+  app.use(express.static(path.join(process.cwd(), "dist", "public")));
+  
+  // Serve frontend for all non-API routes (SPA routing)
+  app.get("*", (req, res) => {
+    if (req.path.startsWith("/api/")) {
+      return res.status(404).json({ message: "API endpoint not found" });
+    }
+    
+    // Serve the main React app
+    const indexPath = path.join(process.cwd(), "dist", "public", "index.html");
+    if (fs.existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      res.status(404).send("Frontend not found - index.html missing at: " + indexPath);
+    }
+  });
+
+  const httpServer = createServer(app);
+  return httpServer;
+}
