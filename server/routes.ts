@@ -1349,6 +1349,25 @@ server {
     }
   });
 
+  
+  // Serve static files from dist/public
+  app.use(express.static('dist/public'));
+  
+  // Serve frontend for all non-API routes
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api/')) {
+      return res.status(404).json({ message: 'API endpoint not found' });
+    }
+    
+    // Serve the main React app
+    const indexPath = path.join(process.cwd(), 'dist', 'public', 'index.html');
+    if (fs.existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      res.status(404).send('Frontend not found');
+    }
+  });
+
   const httpServer = createServer(app);
   return httpServer;
 }
