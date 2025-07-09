@@ -1,5 +1,4 @@
 import type { Express } from "express";
-import express from "express";
 import { createServer, type Server } from "http";
 import multer from "multer";
 import { storage } from "./storage";
@@ -15,9 +14,7 @@ import archiver from 'archiver';
 import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
-// Note: fs import already exists above
 import path from 'path';
-import fs from 'fs';
 import https from 'https';
 
 export async function registerRoutes(app: Express): Promise<Server> {
@@ -1349,6 +1346,25 @@ server {
       console.error('GitHub deployment error:', error);
       res.write(`data: {"type":"error","message":"❌ Deployment failed: ${error.message}"}\n\n`);
       res.end();
+    }
+  });
+
+  
+  // Serve static files from dist/public
+  app.use(express.static('dist/public'));
+  
+  // Serve frontend for all non-API routes (SPA routing)
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api/')) {
+      return res.status(404).json({ message: 'API endpoint not found' });
+    }
+    
+    // Serve the main React app
+    const indexPath = path.join(process.cwd(), 'dist', 'public', 'index.html');
+    if (fs.existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      res.status(404).send('Frontend not found - index.html missing');
     }
   });
 
