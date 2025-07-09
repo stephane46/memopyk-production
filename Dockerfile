@@ -1,41 +1,41 @@
-# Stage 1: build
-FROM node:18-alpine AS builder
-WORKDIR /usr/src/app
+# Multi-stage Docker build for MEMOPYK
+FROM node:18-alpine as builder
 
-# 1) Install everything (including devDeps)
+# Stage 1: Build stage
+WORKDIR /usr/src/app
 COPY package*.json ./
 RUN npm ci
 
-# 2) Copy source and build
+# Copy source and build
 COPY . .
 RUN npm run build
 
-# Stage 2: runtime
+# Stage 2: Production runtime
 FROM node:18-alpine
-WORKDIR /usr/src/app
+WORKDIR /app
 
 # Install curl for health checks
 RUN apk add --no-cache curl
 
-# 3) Install only prod deps
+# Copy package files and install production dependencies
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-# 4) Pull in the built output
+# Copy built application
 COPY --from=builder /usr/src/app/dist ./dist
-
-# 5) Create public directory and copy static files from dist
 RUN mkdir -p public
 COPY --from=builder /usr/src/app/dist/public ./public
 
-# 6) Expose & run
+# Set environment variables
+ENV NODE_ENV=production
 ENV PORT=3000
-EXPOSE 3000
 
-# Health check for Coolify
-HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
   CMD curl -f http://localhost:3000/health || exit 1
 
-# Make sure your Express listens on 0.0.0.0:
-#   app.listen(process.env.PORT, '0.0.0.0')
-CMD ["node", "dist/index.js"]
+# Expose port
+EXPOSE 3000
+
+# Start the application
+CMD ["node", "--experimental-specifier-resolution=node", "dist/index.js"]
